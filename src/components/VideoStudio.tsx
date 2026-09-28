@@ -27,7 +27,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Headphones,
-  Radio
+  RotateCcw
 } from 'lucide-react';
 import { VIDEO_CHAPTERS, VideoChapter } from '../data/pmjdyData';
 
@@ -37,28 +37,28 @@ interface VideoStudioProps {
 }
 
 interface CustomVoiceRecording {
-  chapterId: number; // 0 = Full Video Global Voiceover, 1..6 = specific chapter
+  chapterId: number;
   audioUrl: string;
-  blob?: Blob;
+  blob: Blob;
   fileName: string;
   durationSec: number;
-  mimeType?: string;
+  waveformPeaks: number[];
 }
 
-function getSupportedAudioMimeType(): string {
-  if (typeof window === 'undefined' || typeof MediaRecorder === 'undefined') {
-    return '';
-  }
-  const types = [
+function getBestRecorderMimeType(): string {
+  if (typeof window === 'undefined' || typeof MediaRecorder === 'undefined') return '';
+  const candidates = [
     'audio/webm;codecs=opus',
     'audio/webm',
     'audio/mp4',
     'audio/ogg;codecs=opus',
     'audio/wav'
   ];
-  for (const t of types) {
-    if (MediaRecorder.isTypeSupported(t)) {
-      return t;
+  for (const mime of candidates) {
+    try {
+      if (MediaRecorder.isTypeSupported(mime)) return mime;
+    } catch {
+      // Ignore
     }
   }
   return '';
@@ -78,13 +78,17 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
   const [copiedScript, setCopiedScript] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // Whether user's uploaded voice plays continuously across the entire video or per-chapter
-  const [customPlaybackScope, setCustomPlaybackScope] = useState<'full_video' | 'per_chapter'>('full_video');
+  // Microphone Input Device Selection
+  const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedMicDeviceId, setSelectedMicDeviceId] = useState<string>('default');
 
-  // Global/Full-video voice recording (used when user uploads a single voice file for the whole video)
-  const [globalVoice, setGlobalVoice] = useState<CustomVoiceRecording | null>(null);
+  // Volume Boost (1 = 100%, 2 = 200%, 3 = 300%) via Web Audio GainNode
+  const [volumeBoost, setVolumeBoost] = useState<number>(2);
 
-  // Per-chapter voice recordings (if user records/uploads chapter-by-chapter)
+  // Latest voice recording (used as fallback when playing any chapter)
+  const [latestVoice, setLatestVoice] = useState<CustomVoiceRecording | null>(null);
+
+  // Per-chapter voice recordings (chapterId 1..6)
   const [customRecordings, setCustomRecordings] = useState<Record<number, CustomVoiceRecording>>({});
 
   // Editable scripts per chapterId
@@ -100,94 +104,189 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
   const [audioPlayStatus, setAudioPlayStatus] = useState<string | null>(null);
 
   const playerContainerRef = useRef<HTMLDivElement>(null);
-  // Persistent DOM <audio> element so browsers never block playback
-  const domAudioRef = useRef<HTMLAudioElement | null>(null);
+  const mainAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Web Audio API Gain Booster for playback so even quiet mic recordings sound loud and clear
+  const playbackCtxRef = useRef<AudioContext | null>(null);
+  const playbackGainRef = useRef<GainNode | null>(null);
+  const mediaElementSourceConnectedRef = useRef<boolean>(false);
+
+  // Recording refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserIntervalRef = useRef<number | null>(null);
+  const livePeaksHistoryRef = useRef<number[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingAudioCtxRef = useRef<AudioContext | null>(null);
+  const analyserTimerRef = useRef<number | null>(null);
+  const recStartTimeRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const safeChapterIdx = Math.min(Math.max(0, activeChapterIdx), VIDEO_CHAPTERS.length - 1);
   const currentChapter: VideoChapter = VIDEO_CHAPTERS[safeChapterIdx] || VIDEO_CHAPTERS[0];
 
-  // Resolve the active custom voice for the current chapter (either chapter-specific or global uploaded voice)
+  // Resolve the active custom voice for the current chapter
   const activeCustomVoice: CustomVoiceRecording | undefined =
-    customRecordings[currentChapter.id] || globalVoice || Object.values(customRecordings)[0];
+    customRecordings[currentChapter.id] || latestVoice || Object.values(customRecordings)[0];
 
-  const hasAnyCustomVoice = Boolean(globalVoice || Object.keys(customRecordings).length > 0);
+  const hasAnyCustomVoice = Boolean(activeCustomVoice);
 
   const activeNarrationEn = customScriptsEn[currentChapter.id] ?? currentChapter.narrationEn;
   const activeNarrationHi = customScriptsHi[currentChapter.id] ?? currentChapter.narrationHi;
 
-  // Compute effective chapter duration
+  // Match chapter duration to the user's recorded/uploaded voice duration when in 'custom' mode
   const effectiveDurationSec = (() => {
-    const chapterRec = customRecordings[currentChapter.id];
-    if (customPlaybackScope === 'per_chapter' && chapterRec && chapterRec.durationSec > 2) {
-      return Math.ceil(chapterRec.durationSec);
-    }
-    if (customPlaybackScope === 'full_video' && globalVoice && globalVoice.durationSec > 10) {
-      // Distribute full-video voiceover duration evenly across the 6 chapters
-      return Math.max(8, Math.ceil(globalVoice.durationSec / VIDEO_CHAPTERS.length));
+    if (voiceMode === 'custom' && activeCustomVoice && activeCustomVoice.durationSec >= 2) {
+      return Math.max(4, Math.ceil(activeCustomVoice.durationSec));
     }
     return currentChapter.durationSec;
   })();
 
-  // Stop all audio (both DOM <audio> and Web Speech synthesis)
-  const stopAllAudioPlayback = useCallback(() => {
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+  // Connect Web Audio GainNode booster to mainAudioRef when playing
+  const ensurePlaybackAmplifier = useCallback(
+    (boostFactor: number) => {
+      if (!mainAudioRef.current) return;
+      try {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!AudioCtx) return;
+
+        if (!playbackCtxRef.current) {
+          playbackCtxRef.current = new AudioCtx();
+        }
+        const ctx = playbackCtxRef.current;
+        if (ctx.state === 'suspended') {
+          ctx.resume().catch(() => {});
+        }
+
+        if (!mediaElementSourceConnectedRef.current) {
+          const source = ctx.createMediaElementSource(mainAudioRef.current);
+          const gainNode = ctx.createGain();
+          gainNode.gain.value = boostFactor;
+          source.connect(gainNode);
+          gainNode.connect(ctx.destination);
+          playbackGainRef.current = gainNode;
+          mediaElementSourceConnectedRef.current = true;
+        } else if (playbackGainRef.current) {
+          playbackGainRef.current.gain.value = boostFactor;
+        }
+      } catch {
+        // Fallback to standard HTML5 audio volume if MediaElementSource already bound
+      }
+    },
+    []
+  );
+
+  // Update live gain when user clicks 100% / 200% / 300% boost
+  useEffect(() => {
+    if (playbackGainRef.current) {
+      playbackGainRef.current.gain.value = volumeBoost;
     }
-    if (domAudioRef.current) {
-      domAudioRef.current.pause();
+  }, [volumeBoost]);
+
+  // Enumerate available microphone input devices
+  const refreshMicDevices = useCallback(async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = devices.filter((d) => d.kind === 'audioinput');
+      setMicDevices(audioInputs);
+    } catch {
+      // Ignore
     }
   }, []);
 
-  // Directly start playing the DOM <audio> or Web Speech API
-  const triggerAudioForChapter = useCallback(
+  useEffect(() => {
+    refreshMicDevices();
+  }, [refreshMicDevices]);
+
+  // Test Speaker Sound button
+  const handleTestSpeakerSound = () => {
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(523.25, now);
+      osc.frequency.setValueAtTime(659.25, now + 0.18);
+      osc.frequency.setValueAtTime(783.99, now + 0.36);
+      gain.gain.setValueAtTime(0.35, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.75);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.8);
+
+      setAudioPlayStatus('🔔 Speaker test chime played! Your speaker audio output is working.');
+    } catch {
+      setAudioPlayStatus('Could not play speaker test chime.');
+    }
+  };
+
+  // Stop all audio (both HTMLAudioElement and Web Speech API)
+  const stopAllAudioPlayback = useCallback((resetTime = false) => {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    if (mainAudioRef.current) {
+      mainAudioRef.current.pause();
+      if (resetTime) {
+        try {
+          mainAudioRef.current.currentTime = 0;
+        } catch {
+          // Ignore
+        }
+      }
+    }
+  }, []);
+
+  // Play or resume audio for the given chapter
+  const startOrResumeAudio = useCallback(
     (
       chapter: VideoChapter,
       mode: 'en' | 'hi' | 'custom',
       muted: boolean,
-      isChapterTransition = false
+      forceRestartFromZero = false
     ) => {
       if (muted) {
-        stopAllAudioPlayback();
+        stopAllAudioPlayback(false);
         return;
       }
 
-      const chapterVoice = customRecordings[chapter.id];
-      const fallbackVoice = globalVoice || Object.values(customRecordings)[0];
-      const chosenVoice =
-        customPlaybackScope === 'per_chapter'
-          ? chapterVoice || fallbackVoice
-          : fallbackVoice || chapterVoice;
+      const targetVoice =
+        customRecordings[chapter.id] || latestVoice || Object.values(customRecordings)[0];
 
-      // If user is in 'custom' mode (or has uploaded/recorded a voice and selected custom mode)
-      if (mode === 'custom' && chosenVoice && domAudioRef.current) {
+      // 1. Custom Voice Mode (plays user's recorded/uploaded native audio directly!)
+      if (mode === 'custom' && targetVoice && mainAudioRef.current) {
         if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
           window.speechSynthesis.cancel();
         }
 
-        const audioEl = domAudioRef.current;
+        ensurePlaybackAmplifier(volumeBoost);
 
-        // If full_video scope and the same global audio is already playing during a chapter transition, let it continue smoothly!
-        if (
-          isChapterTransition &&
-          customPlaybackScope === 'full_video' &&
-          !audioEl.paused &&
-          audioEl.src === chosenVoice.audioUrl
-        ) {
-          return;
+        const audioEl = mainAudioRef.current;
+
+        if (audioEl.src !== targetVoice.audioUrl) {
+          audioEl.src = targetVoice.audioUrl;
         }
 
-        if (audioEl.src !== chosenVoice.audioUrl) {
-          audioEl.src = chosenVoice.audioUrl;
-          audioEl.load();
-        } else if (!isChapterTransition) {
-          // If starting fresh, rewind if ended
-          if (audioEl.ended) {
+        if (
+          forceRestartFromZero ||
+          audioEl.ended ||
+          (isFinite(audioEl.duration) &&
+            audioEl.duration > 0 &&
+            audioEl.currentTime >= audioEl.duration - 0.25)
+        ) {
+          try {
             audioEl.currentTime = 0;
+          } catch {
+            // Ignore
           }
         }
 
@@ -198,21 +297,23 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
         if (playPromise !== undefined) {
           playPromise
             .then(() => {
-              setAudioPlayStatus(`Playing your voice: ${chosenVoice.fileName}`);
+              setAudioPlayStatus(
+                `🔊 Playing your voice (${volumeBoost * 100}% Volume Boost): ${targetVoice.fileName}`
+              );
             })
             .catch((err) => {
-              console.warn('Custom audio playback error:', err);
+              console.warn('Audio play warning:', err);
               setAudioPlayStatus(
-                'Could not auto-start audio. Please click the Play button on the audio player below.'
+                'Click the Play button inside the audio bar below to start listening.'
               );
             });
         }
         return;
       }
 
-      // If user is in 'custom' mode, has NO custom voice uploaded yet, fallback to English TTS so it's never silent
-      if (domAudioRef.current && !domAudioRef.current.paused) {
-        domAudioRef.current.pause();
+      // 2. Built-in AI Voiceover Mode (English or Hindi)
+      if (mainAudioRef.current && !mainAudioRef.current.paused) {
+        mainAudioRef.current.pause();
       }
 
       if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
@@ -241,44 +342,59 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
       window.speechSynthesis.speak(utterance);
     },
     [
-      customPlaybackScope,
       customRecordings,
       customScriptsEn,
       customScriptsHi,
-      globalVoice,
-      stopAllAudioPlayback
+      ensurePlaybackAmplifier,
+      latestVoice,
+      stopAllAudioPlayback,
+      volumeBoost
     ]
   );
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopAllAudioPlayback();
-      if (analyserIntervalRef.current) window.clearInterval(analyserIntervalRef.current);
-      if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
+      stopAllAudioPlayback(false);
+      if (analyserTimerRef.current) window.clearInterval(analyserTimerRef.current);
+      if (recordingAudioCtxRef.current) {
+        recordingAudioCtxRef.current.close().catch(() => {});
+      }
+      if (recordingStreamRef.current) {
+        recordingStreamRef.current.getTracks().forEach((t) => t.stop());
+      }
     };
   }, [stopAllAudioPlayback]);
 
-  // Handle chapter transitions while video is playing
-  const prevChapterIdxRef = useRef(activeChapterIdx);
+  // Handle automatic chapter transitions while video is playing
+  const prevChapterIdxRef = useRef(safeChapterIdx);
   useEffect(() => {
-    if (prevChapterIdxRef.current !== activeChapterIdx) {
-      prevChapterIdxRef.current = activeChapterIdx;
+    if (prevChapterIdxRef.current !== safeChapterIdx) {
+      prevChapterIdxRef.current = safeChapterIdx;
       if (isPlaying) {
-        triggerAudioForChapter(currentChapter, voiceMode, isMuted, true);
+        startOrResumeAudio(currentChapter, voiceMode, isMuted, true);
       }
     }
-  }, [activeChapterIdx, currentChapter, isMuted, isPlaying, triggerAudioForChapter, voiceMode]);
+  }, [safeChapterIdx, currentChapter, isMuted, isPlaying, startOrResumeAudio, voiceMode]);
 
   // Timer interval for video progress
   useEffect(() => {
     if (!isPlaying) return;
     const interval = setInterval(() => {
-      setElapsedInChapter((prev) => prev + 0.25);
+      if (
+        voiceMode === 'custom' &&
+        mainAudioRef.current &&
+        !mainAudioRef.current.paused &&
+        mainAudioRef.current.currentTime > 0
+      ) {
+        setElapsedInChapter(mainAudioRef.current.currentTime);
+      } else {
+        setElapsedInChapter((prev) => prev + 0.25);
+      }
     }, 250);
 
     return () => clearInterval(interval);
-  }, [isPlaying]);
+  }, [isPlaying, voiceMode]);
 
   // Advance chapter or stop when elapsedInChapter reaches effectiveDurationSec
   useEffect(() => {
@@ -289,7 +405,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
         setElapsedInChapter(0);
       } else {
         setIsPlaying(false);
-        stopAllAudioPlayback();
+        stopAllAudioPlayback(true);
         setElapsedInChapter(effectiveDurationSec);
       }
     }
@@ -304,12 +420,12 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
     return () => clearInterval(recInterval);
   }, [isRecordingMic]);
 
-  // Start Microphone Recording
+  // Start Microphone Recording — Preserves 100% Native MediaRecorder Stream Without Destructive Re-encoding!
   const handleStartMicRecording = async () => {
     setMicError(null);
     setAudioPlayStatus(null);
     setIsPlaying(false);
-    stopAllAudioPlayback();
+    stopAllAudioPlayback(true);
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setMicError(
@@ -319,121 +435,184 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-      recordedChunksRef.current = [];
-      setRecordingSeconds(0);
+      // Use standard OS voice capture pipeline (do NOT disable echoCancellation/noiseSuppression as that mutes Realtek/Windows mics)
+      const constraints: MediaStreamConstraints = {
+        audio:
+          selectedMicDeviceId && selectedMicDeviceId !== 'default'
+            ? { deviceId: { exact: selectedMicDeviceId } }
+            : true
+      };
 
-      // Live audio level meter
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      recordingStreamRef.current = stream;
+      recordedChunksRef.current = [];
+      livePeaksHistoryRef.current = [];
+      setRecordingSeconds(0);
+      recStartTimeRef.current = Date.now();
+
+      refreshMicDevices();
+
+      // Set up live microphone level meter (connected to a 0.0001 gain sink so Chrome pulls samples without speaker feedback)
       try {
         const AudioCtx =
           window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         const audioCtx = new AudioCtx();
-        audioContextRef.current = audioCtx;
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+        recordingAudioCtxRef.current = audioCtx;
+
         const source = audioCtx.createMediaStreamSource(stream);
         const analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyser.fftSize = 512;
+        const microSink = audioCtx.createGain();
+        microSink.gain.value = 0.0001; // Non-zero so Blink audio graph pulls frames continuously
 
-        analyserIntervalRef.current = window.setInterval(() => {
-          analyser.getByteFrequencyData(dataArray);
-          const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-          setMicLevel(Math.min(100, Math.round((avg / 100) * 100)));
+        source.connect(analyser);
+        analyser.connect(microSink);
+        microSink.connect(audioCtx.destination);
+
+        const dataArray = new Uint8Array(analyser.fftSize);
+        analyserTimerRef.current = window.setInterval(() => {
+          analyser.getByteTimeDomainData(dataArray);
+          let maxDeviation = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            const dev = Math.abs(dataArray[i] - 128);
+            if (dev > maxDeviation) maxDeviation = dev;
+          }
+          const pct = Math.min(100, Math.max(12, Math.round((maxDeviation / 64) * 100)));
+          setMicLevel(pct);
+          livePeaksHistoryRef.current.push(pct);
         }, 100);
       } catch {
-        // Ignore analyser error
+        // Ignore meter error; MediaRecorder still records independently
       }
 
-      const supportedMime = getSupportedAudioMimeType();
-      const recorder = supportedMime
-        ? new MediaRecorder(stream, { mimeType: supportedMime })
+      // Native MediaRecorder — records directly from stream without any re-encoding loss
+      const mimeType = getBestRecorderMimeType();
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
         : new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
 
-      const startTime = Date.now();
-
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          recordedChunksRef.current.push(e.data);
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          recordedChunksRef.current.push(ev.data);
         }
       };
 
-      recorder.onstop = () => {
-        const durationRecorded = Math.max(3, Math.round((Date.now() - startTime) / 1000));
-        const actualMime = recorder.mimeType || supportedMime || 'audio/webm';
-        const blob = new Blob(recordedChunksRef.current, { type: actualMime });
-        const audioUrl = URL.createObjectURL(blob);
-        const ext = actualMime.includes('mp4')
-          ? 'm4a'
-          : actualMime.includes('ogg')
-          ? 'ogg'
-          : 'webm';
-
-        const newRec: CustomVoiceRecording = {
-          chapterId: currentChapter.id,
-          audioUrl,
-          blob,
-          fileName: `PMJDY_${currentChapter.chapterCode}_MyVoice.${ext}`,
-          durationSec: durationRecorded,
-          mimeType: actualMime
-        };
-
-        setCustomRecordings((prev) => ({
-          ...prev,
-          [currentChapter.id]: newRec
-        }));
-
-        // Also set as global fallback so playing from any chapter works immediately
-        setGlobalVoice((prev) => prev ?? newRec);
-        setVoiceMode('custom');
-        setIsRecordingMic(false);
-        setMicLevel(0);
-        setAudioPlayStatus(
-          `Recorded ${durationRecorded}s voiceover for ${currentChapter.chapterCode}. Click "Play Video (With My Voice)" to listen!`
-        );
-
-        // Preload into DOM audio element immediately
-        if (domAudioRef.current) {
-          domAudioRef.current.src = audioUrl;
-          domAudioRef.current.load();
-        }
-
-        if (analyserIntervalRef.current) {
-          window.clearInterval(analyserIntervalRef.current);
-          analyserIntervalRef.current = null;
-        }
-        stream.getTracks().forEach((track) => track.stop());
-      };
-
-      recorder.start(250);
+      recorder.start(200);
       setIsRecordingMic(true);
     } catch {
       setMicError(
-        'Microphone access was blocked or unavailable. Please allow microphone permission in your browser, or click "Upload Voice File" to attach an audio recording from your phone/computer.'
+        'Microphone access was blocked or unavailable. Please allow microphone permission in your browser settings, or click "Upload Voice File" to select an audio file from your device.'
       );
     }
   };
 
-  const handleStopMicRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+  // Stop Microphone Recording — Uses the exact native MediaRecorder Blob directly!
+  const handleStopMicRecording = async () => {
+    setIsRecordingMic(false);
+    setMicLevel(0);
+
+    if (analyserTimerRef.current) {
+      window.clearInterval(analyserTimerRef.current);
+      analyserTimerRef.current = null;
     }
+
+    const elapsedSec = Math.max(
+      2,
+      Math.round(((Date.now() - recStartTimeRef.current) / 1000) * 10) / 10
+    );
+
+    const recorder = mediaRecorderRef.current;
+    let finalBlob: Blob | null = null;
+    let finalMime = 'audio/webm';
+
+    if (recorder && recorder.state !== 'inactive') {
+      finalBlob = await new Promise<Blob>((resolve) => {
+        recorder.onstop = () => {
+          finalMime = recorder.mimeType || 'audio/webm';
+          resolve(new Blob(recordedChunksRef.current, { type: finalMime }));
+        };
+        try {
+          recorder.stop();
+        } catch {
+          resolve(new Blob(recordedChunksRef.current, { type: finalMime }));
+        }
+      });
+    } else if (recordedChunksRef.current.length > 0) {
+      finalBlob = new Blob(recordedChunksRef.current, { type: finalMime });
+    }
+
+    if (recordingStreamRef.current) {
+      recordingStreamRef.current.getTracks().forEach((track) => track.stop());
+      recordingStreamRef.current = null;
+    }
+    if (recordingAudioCtxRef.current) {
+      await recordingAudioCtxRef.current.close().catch(() => {});
+      recordingAudioCtxRef.current = null;
+    }
+
+    if (!finalBlob || finalBlob.size === 0) {
+      setMicError('No audio data was captured. Please try recording again or upload a voice file.');
+      return;
+    }
+
+    const audioUrl = URL.createObjectURL(finalBlob);
+    const ext = finalMime.includes('mp4') ? 'm4a' : finalMime.includes('ogg') ? 'ogg' : 'webm';
+
+    // Build 36 visual bars from the live recording history
+    const history = livePeaksHistoryRef.current;
+    const bars: number[] = [];
+    for (let i = 0; i < 36; i++) {
+      if (history.length > 0) {
+        const idx = Math.min(history.length - 1, Math.floor((i / 36) * history.length));
+        bars.push(Math.max(18, history[idx]));
+      } else {
+        bars.push(35);
+      }
+    }
+
+    const newRec: CustomVoiceRecording = {
+      chapterId: currentChapter.id,
+      audioUrl,
+      blob: finalBlob,
+      fileName: `PMJDY_${currentChapter.chapterCode}_MyVoice.${ext}`,
+      durationSec: elapsedSec,
+      waveformPeaks: bars
+    };
+
+    setCustomRecordings((prev) => ({
+      ...prev,
+      [currentChapter.id]: newRec
+    }));
+    setLatestVoice(newRec);
+    setVoiceMode('custom');
+    setElapsedInChapter(0);
+
+    if (mainAudioRef.current) {
+      mainAudioRef.current.src = audioUrl;
+      mainAudioRef.current.load();
+    }
+
+    setAudioPlayStatus(
+      `✓ Recorded ${elapsedSec}s of your voice (${(finalBlob.size / 1024).toFixed(
+        1
+      )} KB)! Click "Play Video + My Voice" or press Play on the audio bar below.`
+    );
   };
 
-  // Handle uploading an external audio file (.mp3, .wav, .m4a, .aac, .ogg, .webm, .mp4)
+  // Handle uploading an external audio file — Uses the exact native File directly without re-encoding!
   const handleUploadAudioFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
+
     setMicError(null);
     setIsPlaying(false);
-    stopAllAudioPlayback();
+    stopAllAudioPlayback(true);
 
     const audioUrl = URL.createObjectURL(file);
 
@@ -443,62 +622,65 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
       blob: file,
       fileName: file.name,
       durationSec: currentChapter.durationSec,
-      mimeType: file.type || 'audio/mpeg'
+      waveformPeaks: Array.from({ length: 36 }, (_, i) => 25 + ((i * 17) % 60))
     };
 
-    // Save both to current chapter AND global voice so it NEVER plays blank regardless of which chapter is active!
-    setGlobalVoice(initialRec);
     setCustomRecordings((prev) => ({
       ...prev,
       [currentChapter.id]: initialRec
     }));
+    setLatestVoice(initialRec);
     setVoiceMode('custom');
-    setAudioPlayStatus(`Uploaded "${file.name}". Ready to play!`);
+    setElapsedInChapter(0);
 
-    // Load directly into the persistent DOM <audio> element and read real duration
-    if (domAudioRef.current) {
-      domAudioRef.current.src = audioUrl;
-      domAudioRef.current.load();
+    if (mainAudioRef.current) {
+      mainAudioRef.current.src = audioUrl;
+      mainAudioRef.current.load();
     }
 
-    const tempAudio = new Audio();
-    tempAudio.preload = 'metadata';
-    tempAudio.src = audioUrl;
+    // Read real duration from metadata once loaded
+    const tempAudio = new Audio(audioUrl);
     tempAudio.onloadedmetadata = () => {
-      if (tempAudio.duration && isFinite(tempAudio.duration) && tempAudio.duration > 1) {
-        const realDuration = Math.ceil(tempAudio.duration);
-        const updatedRec: CustomVoiceRecording = {
+      if (tempAudio.duration && isFinite(tempAudio.duration) && tempAudio.duration > 0.5) {
+        const realDur = Math.round(tempAudio.duration * 10) / 10;
+        const updated: CustomVoiceRecording = {
           ...initialRec,
-          durationSec: realDuration
+          durationSec: realDur
         };
-        setGlobalVoice(updatedRec);
         setCustomRecordings((prev) => ({
           ...prev,
-          [currentChapter.id]: updatedRec
+          [currentChapter.id]: updated
         }));
+        setLatestVoice(updated);
       }
     };
 
-    e.target.value = '';
+    setAudioPlayStatus(
+      `✓ Uploaded "${file.name}" (${(file.size / 1024).toFixed(
+        1
+      )} KB). Click "Play Video + My Voice" to listen!`
+    );
   };
 
   const handleDeleteCustomVoice = (chapterId: number) => {
-    stopAllAudioPlayback();
+    stopAllAudioPlayback(true);
     setCustomRecordings((prev) => {
       const next = { ...prev };
       delete next[chapterId];
+      const remaining = Object.values(next);
+      setLatestVoice(remaining.length > 0 ? remaining[remaining.length - 1] : null);
+      if (remaining.length === 0) {
+        setVoiceMode('en');
+      }
       return next;
     });
-    if (globalVoice?.chapterId === chapterId) {
-      setGlobalVoice(null);
-    }
     setAudioPlayStatus(null);
   };
 
   const handleClearAllCustomVoices = () => {
-    stopAllAudioPlayback();
+    stopAllAudioPlayback(true);
     setCustomRecordings({});
-    setGlobalVoice(null);
+    setLatestVoice(null);
     setVoiceMode('en');
     setAudioPlayStatus(null);
   };
@@ -510,7 +692,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
     a.click();
   };
 
-  // Synchronous Play/Pause handler (guarantees browser allows audio playback!)
+  // Synchronous Play / Pause Handler
   const handleTogglePlay = () => {
     if (isRecordingMic) {
       handleStopMicRecording();
@@ -519,75 +701,83 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
 
     if (isPlaying) {
       setIsPlaying(false);
-      stopAllAudioPlayback();
+      stopAllAudioPlayback(false);
     } else {
-      let nextChapterIdx = activeChapterIdx;
-      if (elapsedInChapter >= effectiveDurationSec) {
-        nextChapterIdx = 0;
-        setActiveChapterIdx(0);
-        setElapsedInChapter(0);
-        if (domAudioRef.current) {
-          domAudioRef.current.currentTime = 0;
-        }
-      }
-      const nextMode = hasAnyCustomVoice ? 'custom' : voiceMode;
+      const targetMode = hasAnyCustomVoice ? 'custom' : voiceMode;
       if (hasAnyCustomVoice && voiceMode !== 'custom') {
         setVoiceMode('custom');
       }
+
+      const isAtEnd = elapsedInChapter >= effectiveDurationSec - 0.3;
+      let chapterToPlay = currentChapter;
+
+      if (isAtEnd) {
+        setElapsedInChapter(0);
+        if (safeChapterIdx >= VIDEO_CHAPTERS.length - 1) {
+          setActiveChapterIdx(0);
+          chapterToPlay = VIDEO_CHAPTERS[0];
+        }
+      }
+
       setIsPlaying(true);
-      // Call synchronously inside user click event so browser never blocks audio!
-      triggerAudioForChapter(VIDEO_CHAPTERS[nextChapterIdx], nextMode, isMuted, false);
+      setIsMuted(false);
+      startOrResumeAudio(chapterToPlay, targetMode, false, isAtEnd);
     }
   };
 
-  // Explicit "Play My Voice Now" handler
-  const handlePlayMyVoiceNow = () => {
+  // Explicit "Replay My Voice from 0:00" Handler
+  const handlePlayMyVoiceFromStart = () => {
+    if (isRecordingMic) {
+      handleStopMicRecording();
+      return;
+    }
     if (!hasAnyCustomVoice) {
       setVoiceMode('custom');
       setShowVoiceStudio(true);
       return;
     }
     setVoiceMode('custom');
-    if (elapsedInChapter >= effectiveDurationSec) {
-      setActiveChapterIdx(0);
-      setElapsedInChapter(0);
-    }
-    if (domAudioRef.current) {
-      domAudioRef.current.currentTime = 0;
-    }
-    setIsPlaying(true);
-    triggerAudioForChapter(currentChapter, 'custom', false, false);
     setIsMuted(false);
+    setElapsedInChapter(0);
+    setIsPlaying(true);
+    startOrResumeAudio(currentChapter, 'custom', false, true);
   };
 
   const handleSelectChapter = (idx: number) => {
     if (isRecordingMic) {
       handleStopMicRecording();
     }
-    setActiveChapterIdx(idx);
+    const clampedIdx = Math.min(Math.max(0, idx), VIDEO_CHAPTERS.length - 1);
+    setActiveChapterIdx(clampedIdx);
     setElapsedInChapter(0);
     if (isPlaying) {
-      triggerAudioForChapter(VIDEO_CHAPTERS[idx], voiceMode, isMuted, true);
+      startOrResumeAudio(VIDEO_CHAPTERS[clampedIdx], voiceMode, isMuted, true);
+    } else if (mainAudioRef.current) {
+      try {
+        mainAudioRef.current.currentTime = 0;
+      } catch {
+        // Ignore
+      }
     }
   };
 
   const handleNextChapter = () => {
-    if (activeChapterIdx < VIDEO_CHAPTERS.length - 1) {
-      const nextIdx = activeChapterIdx + 1;
+    if (safeChapterIdx < VIDEO_CHAPTERS.length - 1) {
+      const nextIdx = safeChapterIdx + 1;
       setActiveChapterIdx(nextIdx);
       setElapsedInChapter(0);
       if (isPlaying) {
-        triggerAudioForChapter(VIDEO_CHAPTERS[nextIdx], voiceMode, isMuted, true);
+        startOrResumeAudio(VIDEO_CHAPTERS[nextIdx], voiceMode, isMuted, true);
       }
     }
   };
 
   const handlePrevChapter = () => {
-    const prevIdx = activeChapterIdx > 0 ? activeChapterIdx - 1 : 0;
+    const prevIdx = safeChapterIdx > 0 ? safeChapterIdx - 1 : 0;
     setActiveChapterIdx(prevIdx);
     setElapsedInChapter(0);
     if (isPlaying) {
-      triggerAudioForChapter(VIDEO_CHAPTERS[prevIdx], voiceMode, isMuted, true);
+      startOrResumeAudio(VIDEO_CHAPTERS[prevIdx], voiceMode, isMuted, true);
     }
   };
 
@@ -602,7 +792,10 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
     }
   };
 
-  const progressPercent = Math.min(100, (elapsedInChapter / effectiveDurationSec) * 100);
+  const progressPercent = Math.min(
+    100,
+    (elapsedInChapter / Math.max(1, effectiveDurationSec)) * 100
+  );
   const customRecordedCount = Object.keys(customRecordings).length;
 
   const generateFullVideoScriptText = () => {
@@ -906,20 +1099,6 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Persistent DOM <audio> element for 100% reliable custom voice playback */}
-      <audio
-        ref={domAudioRef}
-        preload="auto"
-        playsInline
-        onEnded={() => {
-          if (customPlaybackScope === 'per_chapter' && safeChapterIdx < VIDEO_CHAPTERS.length - 1) {
-            setActiveChapterIdx((i) => Math.min(VIDEO_CHAPTERS.length - 1, i + 1));
-            setElapsedInChapter(0);
-          }
-        }}
-        className="hidden"
-      />
-
       {/* Main Video Broadcast Player Container */}
       <div
         ref={playerContainerRef}
@@ -936,7 +1115,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
             </span>
             {activeCustomVoice && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#1B6B45] text-[#4ADE80] font-mono-tabular text-[11px] font-semibold">
-                <Mic className="w-3 h-3" /> Custom Voice Ready ({activeCustomVoice.durationSec}s)
+                <Mic className="w-3 h-3" /> My Voice Ready ({activeCustomVoice.durationSec}s)
               </span>
             )}
           </div>
@@ -948,7 +1127,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                 type="button"
                 onClick={() => {
                   setVoiceMode('en');
-                  if (isPlaying) triggerAudioForChapter(currentChapter, 'en', isMuted, false);
+                  if (isPlaying) startOrResumeAudio(currentChapter, 'en', isMuted, true);
                 }}
                 className={`px-2.5 py-1 rounded text-xs font-medium transition cursor-pointer ${
                   voiceMode === 'en'
@@ -962,7 +1141,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                 type="button"
                 onClick={() => {
                   setVoiceMode('hi');
-                  if (isPlaying) triggerAudioForChapter(currentChapter, 'hi', isMuted, false);
+                  if (isPlaying) startOrResumeAudio(currentChapter, 'hi', isMuted, true);
                 }}
                 className={`px-2.5 py-1 rounded text-xs font-medium transition cursor-pointer ${
                   voiceMode === 'hi'
@@ -974,7 +1153,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
               </button>
               <button
                 type="button"
-                onClick={handlePlayMyVoiceNow}
+                onClick={handlePlayMyVoiceFromStart}
                 className={`inline-flex items-center gap-1 px-2.5 py-1 rounded text-xs font-semibold transition cursor-pointer ${
                   voiceMode === 'custom'
                     ? 'bg-[#1B6B45] text-white'
@@ -982,7 +1161,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                 }`}
               >
                 <Mic className="w-3.5 h-3.5" />{' '}
-                {hasAnyCustomVoice ? '▶ Play My Voice' : 'My Voice (Add Below)'}
+                {hasAnyCustomVoice ? '▶ Play My Voice' : 'My Voice (Record Below)'}
               </button>
             </div>
 
@@ -991,13 +1170,13 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
               onClick={() => {
                 const nextMuted = !isMuted;
                 setIsMuted(nextMuted);
-                if (domAudioRef.current) {
-                  domAudioRef.current.muted = nextMuted;
+                if (mainAudioRef.current) {
+                  mainAudioRef.current.muted = nextMuted;
                 }
                 if (nextMuted) {
-                  stopAllAudioPlayback();
+                  stopAllAudioPlayback(false);
                 } else if (isPlaying) {
-                  triggerAudioForChapter(currentChapter, voiceMode, false, false);
+                  startOrResumeAudio(currentChapter, voiceMode, false, false);
                 }
               }}
               className="p-1.5 rounded bg-[#1C2536] border border-white/10 text-[#FAF7F2]/80 hover:text-white cursor-pointer"
@@ -1072,11 +1251,13 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                 <span className="text-[#4ADE80]">
                   {isPlaying
                     ? voiceMode === 'custom' && activeCustomVoice
-                      ? `● PLAYING YOUR VOICE FILE: "${activeCustomVoice.fileName}"`
+                      ? `● PLAYING YOUR VOICE: "${activeCustomVoice.fileName}" (${Math.floor(
+                          elapsedInChapter
+                        )}s / ${effectiveDurationSec}s)`
                       : '● LIVE VOICEOVER NARRATION & CAPTIONS'
                     : hasAnyCustomVoice
-                    ? '⏸ YOUR VOICE IS LOADED — CLICK "PLAY VIDEO (WITH MY VOICE)" BELOW'
-                    : '⏸ TELEPROMPTER & SUBTITLES — CLICK PLAY OR UPLOAD/RECORD YOUR VOICE BELOW'}
+                    ? '⏸ YOUR VOICE IS READY — CLICK "PLAY VIDEO (WITH MY VOICE)" OR "RESUME" BELOW'
+                    : '⏸ TELEPROMPTER & SUBTITLES — CLICK PLAY OR RECORD/UPLOAD YOUR VOICE BELOW'}
                 </span>
               )}
               <span className="text-[#FAF7F2]/75">
@@ -1115,6 +1296,11 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                 <>
                   <Pause className="w-4 h-4" /> Pause Video
                 </>
+              ) : elapsedInChapter > 0 && elapsedInChapter < effectiveDurationSec - 0.5 ? (
+                <>
+                  <Play className="w-4 h-4 fill-current" />{' '}
+                  {hasAnyCustomVoice ? 'Resume Video (My Voice)' : 'Resume Video'}
+                </>
               ) : (
                 <>
                   <Play className="w-4 h-4 fill-current" />{' '}
@@ -1123,14 +1309,13 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
               )}
             </button>
 
-            {/* Dedicated green button if user uploaded a voice so they can test/play it in 1 click */}
-            {hasAnyCustomVoice && !isPlaying && (
+            {hasAnyCustomVoice && (
               <button
                 type="button"
-                onClick={handlePlayMyVoiceNow}
+                onClick={handlePlayMyVoiceFromStart}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#1B6B45] hover:bg-[#155738] text-white font-semibold text-xs sm:text-sm transition cursor-pointer"
               >
-                <Volume2 className="w-4 h-4" /> Play My Uploaded Voice Now
+                <RotateCcw className="w-3.5 h-3.5" /> Replay My Voice from Start
               </button>
             )}
 
@@ -1141,7 +1326,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                 onClick={handleStartMicRecording}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#1C2536] hover:bg-[#263248] border border-white/15 text-white font-semibold text-xs sm:text-sm transition cursor-pointer"
               >
-                <Mic className="w-4 h-4 text-[#4ADE80]" /> Record Mic
+                <Mic className="w-4 h-4 text-[#4ADE80]" /> Record New Voice
               </button>
             ) : (
               <button
@@ -1149,14 +1334,14 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                 onClick={handleStopMicRecording}
                 className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#DC2626] hover:bg-[#B91C1C] text-white font-semibold text-xs sm:text-sm animate-pulse cursor-pointer"
               >
-                <Square className="w-4 h-4 fill-current" /> Stop Recording ({recordingSeconds}s)
+                <Square className="w-4 h-4 fill-current" /> Stop & Save Recording ({recordingSeconds}s)
               </button>
             )}
 
             <button
               type="button"
               onClick={handlePrevChapter}
-              disabled={activeChapterIdx === 0}
+              disabled={safeChapterIdx === 0}
               className="p-2 rounded-lg bg-[#1C2536] border border-white/10 text-[#FAF7F2] disabled:opacity-40 hover:bg-[#263248] cursor-pointer"
               title="Previous Chapter"
             >
@@ -1166,7 +1351,7 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
             <button
               type="button"
               onClick={handleNextChapter}
-              disabled={activeChapterIdx === VIDEO_CHAPTERS.length - 1}
+              disabled={safeChapterIdx === VIDEO_CHAPTERS.length - 1}
               className="p-2 rounded-lg bg-[#1C2536] border border-white/10 text-[#FAF7F2] disabled:opacity-40 hover:bg-[#263248] cursor-pointer"
               title="Next Chapter"
             >
@@ -1177,14 +1362,14 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
           {/* 6 Chapter Quick Jump Pills */}
           <div className="flex items-center gap-1.5 overflow-x-auto py-1">
             {VIDEO_CHAPTERS.map((ch, idx) => {
-              const hasVoice = Boolean(customRecordings[ch.id] || globalVoice);
+              const hasVoice = Boolean(customRecordings[ch.id] || latestVoice);
               return (
                 <button
                   key={ch.id}
                   type="button"
                   onClick={() => handleSelectChapter(idx)}
                   className={`px-2.5 py-1 rounded text-xs font-mono-tabular transition cursor-pointer flex items-center gap-1 ${
-                    idx === activeChapterIdx
+                    idx === safeChapterIdx
                       ? 'bg-[#FAF7F2] text-[#141A24] font-bold'
                       : hasVoice
                       ? 'bg-[#1B6B45]/40 border border-[#4ADE80]/50 text-[#4ADE80]'
@@ -1237,17 +1422,16 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
           <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#E2DDD2] pb-4">
             <div>
               <span className="inline-flex items-center gap-1.5 text-xs font-mono-tabular uppercase tracking-wider text-[#1B6B45] font-bold">
-                <Mic className="w-4 h-4" /> ADD YOUR OWN VOICEOVER TO THIS VIDEO (UPLOAD FILE OR RECORD MIC)
+                <Mic className="w-4 h-4" /> ADD YOUR OWN VOICEOVER TO THIS VIDEO (RECORD MIC OR UPLOAD FILE)
               </span>
               <h3 className="text-xl font-editorial font-bold text-[#141A24] mt-0.5">
                 Custom Voiceover Studio & Direct Audio Player
               </h3>
               <p className="text-xs text-[#4A5260] mt-0.5">
-                Upload your recorded voice file (<code>.mp3</code>, <code>.wav</code>, <code>.m4a</code>, <code>.aac</code>, <code>.ogg</code>, <code>.mp4</code>) or record live with your microphone.
+                Preserves your exact native microphone recording or uploaded audio file with a built-in <strong>200%–300% Volume Booster</strong>.
               </p>
             </div>
 
-            {/* Broad File Input supporting all mobile & desktop voice recording formats */}
             <input
               ref={fileInputRef}
               type="file"
@@ -1257,13 +1441,22 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
             />
 
             <div className="flex flex-wrap items-center gap-2.5">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#D95D24] hover:bg-[#C04E18] text-white text-xs sm:text-sm font-semibold transition shadow-xs cursor-pointer"
-              >
-                <Upload className="w-4 h-4" /> Upload Voice File (.MP3 / .M4A / .WAV)
-              </button>
+              {/* Microphone Input Device Selector */}
+              {micDevices.length > 1 && (
+                <select
+                  value={selectedMicDeviceId}
+                  onChange={(e) => setSelectedMicDeviceId(e.target.value)}
+                  className="px-3 py-2 rounded-lg border border-[#E2DDD2] bg-[#FAF7F2] text-xs font-medium text-[#141A24] max-w-[210px] truncate"
+                  title="Select Microphone Input Device"
+                >
+                  <option value="default">Default Microphone</option>
+                  {micDevices.map((d, i) => (
+                    <option key={d.deviceId || i} value={d.deviceId}>
+                      {d.label || `Microphone ${i + 1}`}
+                    </option>
+                  ))}
+                </select>
+              )}
 
               {!isRecordingMic ? (
                 <button
@@ -1279,14 +1472,31 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                   onClick={handleStopMicRecording}
                   className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#DC2626] hover:bg-[#B91C1C] text-white text-xs sm:text-sm font-semibold animate-pulse cursor-pointer"
                 >
-                  <Square className="w-4 h-4 fill-current" /> Stop Recording ({recordingSeconds}s)
+                  <Square className="w-4 h-4 fill-current" /> Stop & Save Recording ({recordingSeconds}s)
                 </button>
               )}
 
               <button
                 type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#D95D24] hover:bg-[#C04E18] text-white text-xs sm:text-sm font-semibold transition shadow-xs cursor-pointer"
+              >
+                <Upload className="w-4 h-4" /> Upload Voice File (.MP3 / .M4A / .WAV)
+              </button>
+
+              <button
+                type="button"
+                onClick={handleTestSpeakerSound}
+                className="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-lg border border-[#E2DDD2] bg-[#FAF7F2] hover:bg-[#F3EFE6] text-[#141A24] text-xs font-semibold transition cursor-pointer"
+                title="Play a quick chime to verify your speakers are working"
+              >
+                <Volume2 className="w-3.5 h-3.5 text-[#D95D24]" /> Test Speaker Sound
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setIsEditingScript((e) => !e)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-lg border border-[#E2DDD2] bg-white hover:bg-[#FAF7F2] text-[#141A24] text-xs font-semibold transition cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-lg border border-[#E2DDD2] bg-white hover:bg-[#FAF7F2] text-[#141A24] text-xs font-semibold transition cursor-pointer"
               >
                 <Edit3 className="w-3.5 h-3.5 text-[#1E3A5F]" />
                 {isEditingScript ? 'Done Editing Script' : 'Edit Teleprompter Script'}
@@ -1294,73 +1504,142 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
             </div>
           </div>
 
-          {/* DIRECT NATIVE AUDIO PREVIEW BAR WHEN USER UPLOADS OR RECORDS VOICE */}
-          {activeCustomVoice && (
-            <div className="bg-[#1B6B45]/10 border-2 border-[#1B6B45] rounded-xl p-4 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
+          {/* UNIFIED AUDIO PLAYER BAR + VOLUME BOOSTER */}
+          <div
+            className={`rounded-xl p-4 border-2 transition-all ${
+              activeCustomVoice
+                ? 'bg-[#1B6B45]/10 border-[#1B6B45] flex flex-col gap-3'
+                : 'hidden'
+            }`}
+          >
+            <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
               <div className="space-y-1">
                 <div className="flex items-center gap-2 text-xs font-mono-tabular uppercase font-bold text-[#1B6B45]">
-                  <CheckCircle2 className="w-4 h-4" /> YOUR VOICE FILE IS LOADED & ACTIVE: {activeCustomVoice.fileName}
+                  <CheckCircle2 className="w-4 h-4" />
+                  {activeCustomVoice
+                    ? `ACTIVE VOICE FILE: ${activeCustomVoice.fileName} (${activeCustomVoice.durationSec}s)`
+                    : 'NO CUSTOM VOICE RECORDED YET'}
                 </div>
                 <p className="text-xs text-[#141A24]">
                   {audioPlayStatus ||
-                    'Click "Play Video + My Voice Together" on the right, or test your audio file directly using the audio player controls:'}
+                    'Press Play on the audio bar or click "Play Video + My Voice" to listen with boosted volume.'}
                 </p>
-                {/* Playback scope toggle */}
-                <div className="pt-1 flex flex-wrap items-center gap-2">
-                  <span className="text-[11px] font-semibold text-[#4A5260]">Playback Mode:</span>
-                  <button
-                    type="button"
-                    onClick={() => setCustomPlaybackScope('full_video')}
-                    className={`px-2.5 py-1 rounded text-xs font-semibold cursor-pointer ${
-                      customPlaybackScope === 'full_video'
-                        ? 'bg-[#141A24] text-white'
-                        : 'bg-white border border-[#E2DDD2] text-[#4A5260]'
-                    }`}
-                  >
-                    <Radio className="w-3 h-3 inline mr-1" />
-                    Play Continuously Across Entire Video (Recommended)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setCustomPlaybackScope('per_chapter')}
-                    className={`px-2.5 py-1 rounded text-xs font-semibold cursor-pointer ${
-                      customPlaybackScope === 'per_chapter'
-                        ? 'bg-[#141A24] text-white'
-                        : 'bg-white border border-[#E2DDD2] text-[#4A5260]'
-                    }`}
-                  >
-                    Play Per Individual Chapter
-                  </button>
-                </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-3 w-full lg:w-auto">
-                {/* Visible HTML5 Audio Controls so user can always verify & hear their uploaded file */}
+              <div className="flex flex-wrap items-center gap-2.5 w-full lg:w-auto">
+                {/* THE SINGLE UNIFIED <audio> ELEMENT */}
                 <audio
+                  ref={mainAudioRef}
                   controls
-                  src={activeCustomVoice.audioUrl}
+                  preload="auto"
+                  playsInline
+                  src={activeCustomVoice?.audioUrl}
+                  onPlay={() => {
+                    ensurePlaybackAmplifier(volumeBoost);
+                    if (!isPlaying) {
+                      setVoiceMode('custom');
+                      setIsPlaying(true);
+                    }
+                  }}
+                  onPause={() => {
+                    if (
+                      mainAudioRef.current &&
+                      !mainAudioRef.current.ended &&
+                      isPlaying &&
+                      voiceMode === 'custom'
+                    ) {
+                      setIsPlaying(false);
+                    }
+                  }}
+                  onEnded={() => {
+                    if (safeChapterIdx < VIDEO_CHAPTERS.length - 1) {
+                      setActiveChapterIdx((i) => Math.min(VIDEO_CHAPTERS.length - 1, i + 1));
+                      setElapsedInChapter(0);
+                    } else {
+                      setIsPlaying(false);
+                    }
+                  }}
                   className="h-10 max-w-full sm:w-64 rounded-lg"
                 />
 
+                {/* Volume Amplifier Selector (100% / 200% / 300%) */}
+                <div className="inline-flex items-center rounded-lg bg-white border border-[#E2DDD2] p-0.5">
+                  {[1, 2, 3].map((boost) => (
+                    <button
+                      key={boost}
+                      type="button"
+                      onClick={() => {
+                        setVolumeBoost(boost);
+                        ensurePlaybackAmplifier(boost);
+                      }}
+                      className={`px-2 py-1 rounded text-[11px] font-mono-tabular font-bold cursor-pointer ${
+                        volumeBoost === boost
+                          ? 'bg-[#1B6B45] text-white'
+                          : 'text-[#4A5260] hover:text-[#141A24]'
+                      }`}
+                      title={`Boost voice playback volume to ${boost * 100}%`}
+                    >
+                      {boost * 100}% Vol
+                    </button>
+                  ))}
+                </div>
+
                 <button
                   type="button"
-                  onClick={handlePlayMyVoiceNow}
+                  onClick={handlePlayMyVoiceFromStart}
                   className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#1B6B45] hover:bg-[#145335] text-white text-xs sm:text-sm font-bold shadow-sm cursor-pointer shrink-0"
                 >
-                  <Play className="w-4 h-4 fill-current" /> Play Video + My Voice Together
+                  <Play className="w-4 h-4 fill-current" /> Play Video + My Voice
                 </button>
+
+                {activeCustomVoice && (
+                  <button
+                    type="button"
+                    onClick={() => handleDownloadCustomVoice(activeCustomVoice)}
+                    className="p-2.5 rounded-lg bg-white border border-[#E2DDD2] text-[#141A24] hover:bg-[#FAF7F2] cursor-pointer"
+                    title="Download Recorded Voice File"
+                  >
+                    <Download className="w-4 h-4" />
+                  </button>
+                )}
 
                 <button
                   type="button"
                   onClick={handleClearAllCustomVoices}
                   className="p-2.5 rounded-lg bg-white border border-[#FECACA] text-[#DC2626] hover:bg-[#FEF2F2] cursor-pointer"
-                  title="Remove Uploaded Voice"
+                  title="Delete Voice Recording"
                 >
                   <Trash2 className="w-4 h-4" />
                 </button>
               </div>
             </div>
-          )}
+
+            {/* Visual Waveform Graph of Recorded Audio */}
+            {activeCustomVoice && activeCustomVoice.waveformPeaks && (
+              <div className="bg-white/80 rounded-lg px-3.5 py-2.5 border border-[#1B6B45]/25">
+                <div className="flex items-center justify-between text-[10px] font-mono-tabular uppercase text-[#4A5260] mb-1">
+                  <span>
+                    RECORDED VOICE WAVEFORM ({volumeBoost * 100}% AMPLIFIER ACTIVE)
+                  </span>
+                  <span>{activeCustomVoice.durationSec}s AUDIO READY</span>
+                </div>
+                <div className="flex items-end gap-1 h-8">
+                  {activeCustomVoice.waveformPeaks.map((barHeight, i) => {
+                    const isPlayed = (i / activeCustomVoice.waveformPeaks.length) * 100 <= progressPercent;
+                    return (
+                      <div
+                        key={i}
+                        className={`flex-1 rounded-full transition-all ${
+                          isPlayed ? 'bg-[#1B6B45]' : 'bg-[#1B6B45]/30'
+                        }`}
+                        style={{ height: `${Math.max(18, barHeight)}%` }}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
 
           {/* Live Microphone Level Meter when recording */}
           {isRecordingMic && (
@@ -1372,13 +1651,13 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                     Microphone Live — Recording {currentChapter.chapterCode} ({recordingSeconds}s)
                   </div>
                   <div className="text-xs text-[#7F1D1D]">
-                    Read the script below clearly. Click <strong>Stop Recording</strong> when finished.
+                    Speak clearly into your microphone, then click <strong>Stop & Save Recording</strong>.
                   </div>
                 </div>
               </div>
-              <div className="w-full sm:w-48 bg-white rounded-full h-3 border border-[#FCA5A5] overflow-hidden p-0.5">
+              <div className="w-full sm:w-56 bg-white rounded-full h-3.5 border border-[#FCA5A5] overflow-hidden p-0.5">
                 <div
-                  className="h-full bg-gradient-to-r from-[#1B6B45] via-[#F59E0B] to-[#DC2626] rounded-full transition-all duration-100"
+                  className="h-full bg-gradient-to-r from-[#1B6B45] via-[#F59E0B] to-[#DC2626] rounded-full transition-all duration-75"
                   style={{ width: `${Math.max(12, micLevel)}%` }}
                 />
               </div>
@@ -1469,14 +1748,14 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
                   Chapter Voiceover List ({customRecordedCount} / 6)
                 </span>
                 <span className="text-[11px] text-[#1B6B45] font-semibold">
-                  {globalVoice ? 'Full-Video Voice Active' : 'Select Chapter to Record'}
+                  {latestVoice ? 'Custom Voice Active' : 'Select Chapter to Record'}
                 </span>
               </div>
 
               <div className="space-y-2 max-h-[240px] overflow-y-auto pr-1">
                 {VIDEO_CHAPTERS.map((ch, idx) => {
-                  const rec = customRecordings[ch.id] || (customPlaybackScope === 'full_video' ? globalVoice : undefined);
-                  const isSelected = idx === activeChapterIdx;
+                  const rec = customRecordings[ch.id] || latestVoice;
+                  const isSelected = idx === safeChapterIdx;
                   return (
                     <div
                       key={ch.id}
@@ -1581,8 +1860,8 @@ export const VideoStudio: React.FC<VideoStudioProps> = ({
           {/* 6 Chapter Storyboard Cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {VIDEO_CHAPTERS.map((ch, idx) => {
-              const isCurrent = idx === activeChapterIdx;
-              const hasCustomVoice = Boolean(customRecordings[ch.id] || globalVoice);
+              const isCurrent = idx === safeChapterIdx;
+              const hasCustomVoice = Boolean(customRecordings[ch.id] || latestVoice);
               return (
                 <div
                   key={ch.id}
