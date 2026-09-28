@@ -1,0 +1,10 @@
+{
+  "name": "PMJDY — Jan Dhan Yojana PPT, Video & Guidelines Studio",
+  "description": "Comprehensive academic and civic portal for Pradhan Mantri Jan Dhan Yojana (PMJDY) featuring an interactive 12-slide PPT presentation deck with speaker notes, a 6-chapter animated explainer video with bilingual voiceover and script, and official Ministry of Finance guidelines.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
